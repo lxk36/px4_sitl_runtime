@@ -8,6 +8,7 @@ import argparse
 import fcntl
 import json
 import math
+import signal
 import sys
 import time
 import xml.etree.ElementTree as ET
@@ -25,6 +26,10 @@ SPAWN_ATTEMPTS = 4
 SPAWN_RETRY_SECONDS = 0.5
 SETTLE_SECONDS = 0.4
 GAZEBO_SPAWN_LOCK_PATH = "/tmp/xgc2-gazebo-spawn.lock"
+
+
+def request_cancel(_signum, _frame):
+    raise SystemExit(EXIT_TRANSIENT)
 
 
 def _set_plugin_tag(plugin, tag, value):
@@ -143,7 +148,9 @@ def main():
     )
     args = parser.parse_args(rospy.myargv(argv=sys.argv)[1:])
 
-    rospy.init_node("spawn_sdf_model", anonymous=True)
+    signal.signal(signal.SIGTERM, request_cancel)
+    signal.signal(signal.SIGINT, request_cancel)
+    rospy.init_node("spawn_sdf_model", anonymous=True, disable_signals=True)
     sdf = render_sdf(
         args.sdf,
         args.mavlink_tcp_port,
