@@ -1,5 +1,5 @@
 package_name: ros-noetic-xgc2-gazebo-sim-px4-1-12
-debian_version: 1.12.3-26
+debian_version: 1.12.3-27
 px4_repo: https://github.com/PX4/PX4-Autopilot.git
 px4_tag: v1.12.3
 ros_distro: noetic

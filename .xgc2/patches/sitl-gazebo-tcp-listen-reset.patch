@@ -1,0 +1,29 @@
+diff --git a/src/mavlink_interface.cpp b/src/mavlink_interface.cpp
+--- a/src/mavlink_interface.cpp
++++ b/src/mavlink_interface.cpp
+@@ -388,9 +388,10 @@
+ 
+         // client closed the connection orderly, only makes sense on tcp
+         if (use_tcp_ && ret == 0) {
+-          std::cerr << "Connection closed by client." << "\n";
+-          close_conn_ = true;
+-          continue;
++          std::cerr << "Connection closed by client; resetting TCP listen." << "\n";
++          this->close();
++          close_conn_ = false;
++          return;
+         }
+ 
+         // data received
+@@ -592,8 +593,9 @@
+         std::cerr << "Failed sending mavlink message: " << strerror(errno) << "\n";
+         if (errno == ECONNRESET || errno == EPIPE) {
+           if (use_tcp_) { // udp socket remains alive
+-            std::cerr << "Closing connection." << "\n";
+-            close_conn_ = true;
++            std::cerr << "Closing connection; resetting TCP listen." << "\n";
++            this->close();
++            close_conn_ = false;
+           }
+         }
+       }

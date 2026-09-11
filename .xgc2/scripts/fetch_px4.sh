@@ -41,4 +41,15 @@ git -C "${PX4_DIR}" fetch --tags --prune origin >&2
 git -C "${PX4_DIR}" checkout "${PX4_TAG}" >&2
 git -C "${PX4_DIR}" submodule update --init --recursive >&2
 
+SITL_GAZEBO="${PX4_DIR}/Tools/sitl_gazebo"
+PATCH_DIR="$(cd "${SCRIPT_DIR}/../patches" && pwd)"
+if [[ -d "${SITL_GAZEBO}" && -d "${PATCH_DIR}" ]]; then
+  shopt -s nullglob
+  for patch in "${PATCH_DIR}"/*.patch; do
+    echo "Applying $(basename "${patch}") to sitl_gazebo" >&2
+    git -C "${SITL_GAZEBO}" apply "${patch}"
+  done
+  shopt -u nullglob
+fi
+
 echo "${PX4_DIR}"

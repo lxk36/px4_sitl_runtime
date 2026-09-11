@@ -27,7 +27,7 @@ import time
 import xml.etree.ElementTree as ET
 
 import rospy
-from gazebo_msgs.srv import DeleteModel, GetModelState, SpawnModel
+from gazebo_msgs.srv import DeleteModel, GetWorldProperties, SpawnModel
 from geometry_msgs.msg import Pose
 
 EXIT_TRANSIENT = 1
@@ -94,39 +94,59 @@ def acquire_gazebo_spawn_lock():
     return handle
 
 
-def model_exists(get_model_state, model):
-    return bool(get_model_state(model, "world").success)
+def model_exists(get_world_properties, model):
+    # get_model_state.success can be false for a leftover mavlink plugin
+    # after SITL disconnect; the world model list is the occupancy truth.
+    return model in (get_world_properties().model_names or ())
 
 
-def wait_for_model(get_model_state, model, present, deadline_seconds):
+def wait_for_model(get_world_properties, model, present, deadline_seconds):
     deadline = time.monotonic() + deadline_seconds
     while True:
-        if model_exists(get_model_state, model) == present:
+        if model_exists(get_world_properties, model) == present:
             return True
         if time.monotonic() >= deadline:
             return False
         time.sleep(0.1)
 
 
-def spawn_until_visible(spawn, get_model_state, args, sdf, pose):
+def delete_existing_model(delete_model, get_world_properties, model):
+    time.sleep(0.3)
+    result = delete_model(model)
+    if not result.success:
+        rospy.logerr("DeleteModel failed: %s", result.status_message)
+        raise SystemExit(EXIT_TRANSIENT)
+    if not wait_for_model(get_world_properties, model, False, DELETE_WAIT_SECONDS):
+        rospy.logerr("model %s still exists after delete_model", model)
+        raise SystemExit(EXIT_TRANSIENT)
+
+
+def spawn_until_visible(spawn, delete_model, get_world_properties, args, sdf, pose):
     last_message = ""
+    replaced = False
     for attempt in range(1, SPAWN_ATTEMPTS + 1):
-        if model_exists(get_model_state, args.model):
-            return
         result = spawn(args.model, sdf, "", pose, "world")
         last_message = result.status_message
         if result.success and wait_for_model(
-            get_model_state, args.model, True, VERIFY_WAIT_SECONDS
+            get_world_properties, args.model, True, VERIFY_WAIT_SECONDS
         ):
             time.sleep(SETTLE_SECONDS)
             rospy.loginfo("SpawnModel: %s", result.status_message)
-            return
-        if not result.success:
-            if args.existing_model_policy == "fail" and model_exists(
-                get_model_state, args.model
-            ):
+            return replaced
+        if model_exists(get_world_properties, args.model):
+            if args.existing_model_policy == "fail":
                 rospy.logerr("model %s already exists", args.model)
                 raise SystemExit(EXIT_MODEL_EXISTS)
+            if args.existing_model_policy == "keep":
+                return replaced
+            rospy.logwarn(
+                "SpawnModel hit leftover %s (%s); replacing",
+                args.model,
+                result.status_message,
+            )
+            delete_existing_model(delete_model, get_world_properties, args.model)
+            replaced = True
+        elif not result.success:
             rospy.logwarn(
                 "SpawnModel attempt %s failed: %s", attempt, result.status_message
             )
@@ -162,13 +182,20 @@ def main():
     parser.add_argument("--qgc-udp-port", type=int, required=True)
     parser.add_argument("--sdk-udp-port", type=int, required=True)
     parser.add_argument(
-        "--existing-model-policy", choices=("fail", "replace"), default="fail"
+        "--existing-model-policy", choices=("fail", "replace", "keep"), default="fail"
     )
     args = parser.parse_args(rospy.myargv(argv=sys.argv)[1:])
 
     signal.signal(signal.SIGTERM, request_cancel)
     signal.signal(signal.SIGINT, request_cancel)
-    rospy.init_node("spawn_sdf_model", anonymous=True, disable_signals=True)
+    # Operator-side client: do not follow /clock. After a model teardown the
+    # sim-time publisher can stall at Time(0) while gzserver is still reachable.
+    rospy.init_node(
+        "spawn_sdf_model",
+        anonymous=True,
+        disable_signals=True,
+        disable_rostime=True,
+    )
     sdf = render_sdf(
         args.sdf,
         args.mavlink_tcp_port,
@@ -189,23 +216,31 @@ def main():
 
     lock = acquire_gazebo_spawn_lock()
     try:
-        get_model_state = service_proxy("/gazebo/get_model_state", GetModelState)
+        get_world_properties = service_proxy(
+            "/gazebo/get_world_properties", GetWorldProperties
+        )
+        delete_model = service_proxy("/gazebo/delete_model", DeleteModel)
+        spawn = service_proxy("/gazebo/spawn_sdf_model", SpawnModel)
         replaced = False
-        if args.existing_model_policy == "replace" and model_exists(
-            get_model_state, args.model
-        ):
-            delete_model = service_proxy("/gazebo/delete_model", DeleteModel)
-            result = delete_model(args.model)
-            if not result.success:
-                rospy.logerr("DeleteModel failed: %s", result.status_message)
-                raise SystemExit(EXIT_TRANSIENT)
-            if not wait_for_model(get_model_state, args.model, False, DELETE_WAIT_SECONDS):
-                rospy.logerr("model %s still exists after delete_model", args.model)
-                raise SystemExit(EXIT_TRANSIENT)
+        if model_exists(get_world_properties, args.model):
+            if args.existing_model_policy == "fail":
+                rospy.logerr("model %s already exists", args.model)
+                raise SystemExit(EXIT_MODEL_EXISTS)
+            if args.existing_model_policy == "keep":
+                # keep is the PX4 SITL reconnect path. The leftover mavlink
+                # plugin must close() the TCP client and re-listen; delete_model
+                # to mint a new plugin instance hangs gzserver.
+                print(
+                    "SPAWN_SDF_RESULT " + json.dumps({"replaced": False, "reused": True}),
+                    flush=True,
+                )
+                return
+            delete_existing_model(delete_model, get_world_properties, args.model)
             replaced = True
 
-        spawn = service_proxy("/gazebo/spawn_sdf_model", SpawnModel)
-        spawn_until_visible(spawn, get_model_state, args, sdf, pose)
+        replaced = spawn_until_visible(
+            spawn, delete_model, get_world_properties, args, sdf, pose
+        ) or replaced
         print("SPAWN_SDF_RESULT " + json.dumps({"replaced": replaced}), flush=True)
     finally:
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
